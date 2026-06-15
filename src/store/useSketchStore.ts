@@ -1,19 +1,10 @@
-/**
- * SketchBake — Global State (Zustand)
- *
- * Single store for:
- * - Active sketch document (live, unsaved)
- * - History tree
- * - Active tool
- * - Selected shape IDs
- * - Last bake result
- */
+'use client';
 
 import { create } from 'zustand';
 import { nanoid } from 'nanoid';
 import type {
+  BakeParams,
   BakeResult,
-  BakedMesh,
   HistoryTree,
   ShapeKind,
   SketchDoc,
@@ -27,21 +18,17 @@ import { bakeSketch } from '../lib/bake';
 export type Tool = 'select' | 'wall' | 'room' | 'dome' | 'arch' | 'stairs' | 'column';
 
 interface SketchState {
-  // Live sketch
   sketch: SketchDoc;
-  // Snapshot history
   history: HistoryTree;
-  // Editor state
   activeTool: Tool;
   selectedShapeIds: string[];
-  // Bake
   bakeResult: BakeResult | null;
   isBaking: boolean;
 
-  // Actions
   addShape: (kind: ShapeKind, points: Vec2[]) => void;
   removeShape: (id: string) => void;
   updateShapePoints: (id: string, points: Vec2[]) => void;
+  updateShapeParams: (id: string, params: BakeParams) => void;
   setActiveTool: (tool: Tool) => void;
   setSelectedShapes: (ids: string[]) => void;
   commitSnapshot: (label: string) => void;
@@ -51,7 +38,7 @@ interface SketchState {
 }
 
 export const useSketchStore = create<SketchState>((set, get) => {
-  const initialSketch = createSketchDoc('Untitled');
+  const initialSketch  = createSketchDoc('Untitled');
   const initialHistory = createHistoryTree(initialSketch);
 
   return {
@@ -78,30 +65,30 @@ export const useSketchStore = create<SketchState>((set, get) => {
       }));
     },
 
-    removeShape: (id) => {
+    removeShape: (id) =>
       set(s => ({
-        sketch: {
-          ...s.sketch,
-          shapes: s.sketch.shapes.filter(sh => sh.id !== id),
-        },
+        sketch: { ...s.sketch, shapes: s.sketch.shapes.filter(sh => sh.id !== id) },
         selectedShapeIds: s.selectedShapeIds.filter(sid => sid !== id),
-      }));
-    },
+      })),
 
-    updateShapePoints: (id, points) => {
+    updateShapePoints: (id, points) =>
       set(s => ({
         sketch: {
           ...s.sketch,
-          shapes: s.sketch.shapes.map(sh =>
-            sh.id === id ? { ...sh, points } : sh
-          ),
+          shapes: s.sketch.shapes.map(sh => sh.id === id ? { ...sh, points } : sh),
         },
-      }));
-    },
+      })),
 
-    setActiveTool: (tool) => set({ activeTool: tool }),
+    updateShapeParams: (id, params) =>
+      set(s => ({
+        sketch: {
+          ...s.sketch,
+          shapes: s.sketch.shapes.map(sh => sh.id === id ? { ...sh, params } : sh),
+        },
+      })),
 
-    setSelectedShapes: (ids) => set({ selectedShapeIds: ids }),
+    setActiveTool: tool => set({ activeTool: tool }),
+    setSelectedShapes: ids => set({ selectedShapeIds: ids }),
 
     commitSnapshot: (label) => {
       const { sketch, history } = get();
@@ -109,10 +96,8 @@ export const useSketchStore = create<SketchState>((set, get) => {
     },
 
     checkoutNode: (nodeId) => {
-      const { history } = get();
-      const newTree = checkoutNode(history, nodeId);
-      const node = newTree.nodes[nodeId];
-      set({ history: newTree, sketch: node.sketch });
+      const newTree = checkoutNode(get().history, nodeId);
+      set({ history: newTree, sketch: newTree.nodes[nodeId].sketch });
     },
 
     bake: async () => {
@@ -128,12 +113,7 @@ export const useSketchStore = create<SketchState>((set, get) => {
 
     newSketch: (name = 'Untitled') => {
       const sketch = createSketchDoc(name);
-      set({
-        sketch,
-        history: createHistoryTree(sketch),
-        bakeResult: null,
-        selectedShapeIds: [],
-      });
+      set({ sketch, history: createHistoryTree(sketch), bakeResult: null, selectedShapeIds: [] });
     },
   };
 });

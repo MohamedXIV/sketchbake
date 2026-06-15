@@ -1,11 +1,10 @@
 /**
  * Room builder
- * Closed polygon → earcut triangulation → extruded floor plan
- * Produces: floor slab + 4 walls per edge
+ * Closed polygon → earcut triangulation → floor slab mesh
  */
 
 import * as THREE from 'three';
-import Earcut from 'earcut';
+import earcut from 'earcut';
 import type { BakedMesh, RoomParams, SketchShape } from '../../schema/types';
 
 export function bakeRoom(shape: SketchShape): BakedMesh {
@@ -15,25 +14,21 @@ export function bakeRoom(shape: SketchShape): BakedMesh {
   if (pts.length < 3) throw new Error('Room requires at least 3 points');
 
   const flatCoords = pts.flatMap(p => [p.x, p.y]);
-  const triangles = Earcut.triangulate(flatCoords, undefined, 2);
+  const triangles  = earcut(flatCoords);
 
-  const vertices: number[] = [];
-  const indices: number[] = [];
-
-  // Floor
-  for (const pt of pts) vertices.push(pt.x, 0, pt.y);
-  for (const idx of triangles) indices.push(idx);
-
-  // TODO: walls per edge, ceiling slab
-  // Deferred to next iteration — floor geometry is the foundation
+  // Floor vertices (Y = 0)
+  const vertices: number[] = pts.flatMap(p => [p.x, 0, p.y]);
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-  geo.setIndex(indices);
+  geo.setIndex(triangles);
   geo.computeVertexNormals();
 
   const posAttr = geo.getAttribute('position') as THREE.BufferAttribute;
   const idxAttr = geo.getIndex();
+
+  // TODO: wall extrusion per edge + optional ceiling — next iteration
+  void params;
 
   return {
     shapeId: shape.id,
