@@ -1,20 +1,48 @@
 'use client';
 
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect, useCallback, useState } from 'react';
 import { useSketchStore } from '../../store/useSketchStore';
 import type { Vec2, SketchShape, ShapeKind } from '../../lib/schema/types';
 
-const PPU  = 40; // pixels per world unit
-const GRID = 1;  // snap resolution (world units)
+// ---- View types ----
+export type CanvasView = 'top' | 'front' | 'side';
 
-// ---- Coordinate helpers ----
-function toWorld(cx: number, cy: number, w: number, h: number): Vec2 {
-  return { x: (cx - w / 2) / PPU, y: (cy - h / 2) / PPU };
+const VIEW_META: Record<CanvasView, {
+  label: string; hAxis: string; vAxis: string; hColor: string; vColor: string;
+}> = {
+  top:   { label: 'Top (XZ)',   hAxis: 'X', vAxis: 'Z', hColor: '#ef4444', vColor: '#3b82f6' },
+  front: { label: 'Front (XY)', hAxis: 'X', vAxis: 'Y', hColor: '#ef4444', vColor: '#22c55e' },
+  side:  { label: 'Side (ZY)',  hAxis: 'Z', vAxis: 'Y', hColor: '#3b82f6', vColor: '#22c55e' },
+};
+
+// ---- Constants ----
+const DEFAULT_PPU = 40;
+const MIN_PPU     = 6;
+const MAX_PPU     = 320;
+const GRID        = 1;   // snap resolution in world units
+
+// ---- Colours ----
+const COLOR: Record<string, string> = {
+  wall: '#60a5fa', room: '#34d399', dome: '#a78bfa',
+  arch: '#f59e0b', stairs: '#fb923c', column: '#f472b6', custom: '#94a3b8',
+};
+
+// ---- Pure coordinate helpers ----
+function toWorld(
+  cx: number, cy: number,
+  w: number, h: number,
+  ppu: number, pan: { x: number; y: number },
+): Vec2 {
+  return { x: (cx - w / 2 - pan.x) / ppu, y: (cy - h / 2 - pan.y) / ppu };
 }
-function toCanvas(wx: number, wy: number, w: number, h: number): [number, number] {
-  return [wx * PPU + w / 2, wy * PPU + h / 2];
+function toCanvas(
+  wx: number, wy: number,
+  w: number, h: number,
+  ppu: number, pan: { x: number; y: number },
+): [number, number] {
+  return [wx * ppu + w / 2 + pan.x, wy * ppu + h / 2 + pan.y];
 }
-function snap(v: Vec2): Vec2 {
+function snapGrid(v: Vec2): Vec2 {
   return { x: Math.round(v.x / GRID) * GRID, y: Math.round(v.y / GRID) * GRID };
 }
 function dist2(a: Vec2, b: Vec2) {
@@ -26,26 +54,34 @@ function centroid(pts: Vec2[]): Vec2 {
   return { x: s.x / pts.length, y: s.y / pts.length };
 }
 
-// ---- Per-kind colours ----
-const COLOR: Record<string, string> = {
-  wall:   '#60a5fa',
-  room:   '#34d399',
-  dome:   '#a78bfa',
-  arch:   '#f59e0b',
-  stairs: '#fb923c',
-  column: '#f472b6',
-  custom: '#94a3b8',
-};
-
 interface InProgress { points: Vec2[]; cursor: Vec2 | null; }
 
+const BTN = 'px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer';
+const BTN_ON  = `${BTN} bg-neutral-600 text-white`;
+const BTN_OFF = `${BTN} text-neutral-500 hover:bg-neutral-700 hover:text-white`;
+
 export function SketchCanvas() {
-  const canvasRef    = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const coordsRef    = useRef<HTMLSpanElement>(null);
-  const sizeRef      = useRef({ w: 800, h: 600 });
-  const ip           = useRef<InProgress>({ points: [], cursor: null });
-  const renderRef    = useRef<() => void>(() => {});
+  const canvasRef      = useRef<HTMLCanvasElement>(null);
+  const containerRef   = useRef<HTMLDivElement>(null);
+  const coordsRef      = useRef<HTMLSpanElement>(null);
+  const zoomLabelRef   = useRef<HTMLSpanElement>(null);
+
+  // View state — mutable refs for rendering, React state for overlay re-render
+  const [view, setView] = useState<CanvasView>('top');
+  const viewRef         = useRef<CanvasView>('top');
+  useEffect(() => { viewRef.current = view; }, [view]);
+
+  const sizeRef = useRef({ w: 800, h: 600 });
+  const ppuRef  = useRef(DEFAULT_PPU);   // pixels per world unit
+  const panRef  = useRef({ x: 0, y: 0 }); // canvas-space offset
+
+  const ip          = useRef<InProgress>({ points: [], cursor: null });
+  const renderRef   = useRef<() => void>(() => {});
+
+  // Pan interaction
+  const isPanning   = useRef(false);
+  const panStart    = useRef({ mx: 0, my: 0, px: 0, py: 0 });
+  const spaceHeld   = useRef(false);
 
   const sketch            = useSketchStore(s => s.sketch);
   const activeTool        = useSketchStore(s => s.activeTool);
@@ -54,7 +90,15 @@ export function SketchCanvas() {
   const removeShape       = useSketchStore(s => s.removeShape);
   const setSelectedShapes = useSketchStore(s => s.setSelectedShapes);
 
-  // --- Rebuild render closure on state change, fire immediately ---
+  // ---- Sync zoom label helper ----
+  const syncZoomLabel = useCallback(() => {
+    if (zoomLabelRef.current)
+      zoomLabelRef.current.textContent = `${Math.round(ppuRef.current / DEFAULT_PPU * 100)}%`;
+  }, []);
+
+  // ----------------------------------------------------------------
+  // Render closure — rebuilt whenever React state changes
+  // ----------------------------------------------------------------
   useEffect(() => {
     renderRef.current = () => {
       const canvas = canvasRef.current;
@@ -62,27 +106,37 @@ export function SketchCanvas() {
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       const { w, h } = sizeRef.current;
+      const ppu = ppuRef.current;
+      const pan = panRef.current;
+      const vm  = VIEW_META[viewRef.current];
 
-      canvas.style.cursor = activeTool === 'select' ? 'default' : 'crosshair';
+      const cursorStyle =
+        isPanning.current  ? 'grabbing' :
+        spaceHeld.current  ? 'grab'     :
+        activeTool === 'select' ? 'default' : 'crosshair';
+      canvas.style.cursor = cursorStyle;
 
       ctx.clearRect(0, 0, w, h);
       ctx.fillStyle = '#161622';
       ctx.fillRect(0, 0, w, h);
-      drawGrid(ctx, w, h);
+
+      drawGrid(ctx, w, h, ppu, pan, vm);
+
       for (const shape of sketch.shapes)
-        drawShape(ctx, shape, w, h, selectedShapeIds.includes(shape.id));
+        drawShape(ctx, shape, w, h, ppu, pan, selectedShapeIds.includes(shape.id));
+
       const { points, cursor } = ip.current;
-      if (cursor) drawPreview(ctx, activeTool, points, cursor, w, h);
+      if (cursor) drawPreview(ctx, activeTool, points, cursor, w, h, ppu, pan);
     };
     renderRef.current();
-  }, [sketch, selectedShapeIds, activeTool]);
+  }, [sketch, selectedShapeIds, activeTool, view]);
 
-  // --- Resize observer ---
+  // ---- Resize observer ----
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(([entry]) => {
-      const { width: w, height: h } = entry.contentRect;
+    const ro = new ResizeObserver(([e]) => {
+      const { width: w, height: h } = e.contentRect;
       sizeRef.current = { w, h };
       const c = canvasRef.current;
       if (c) { c.width = w; c.height = h; }
@@ -92,10 +146,44 @@ export function SketchCanvas() {
     return () => ro.disconnect();
   }, []);
 
-  // --- Global keyboard shortcuts ---
+  // ---- Zoom: non-passive wheel (zoom to cursor) ----
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect   = canvas.getBoundingClientRect();
+      const { w, h } = sizeRef.current;
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+
+      // World position under cursor before zoom
+      const wx = (mx - w / 2 - panRef.current.x) / ppuRef.current;
+      const wy = (my - h / 2 - panRef.current.y) / ppuRef.current;
+
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const newPPU = Math.max(MIN_PPU, Math.min(MAX_PPU, ppuRef.current * factor));
+
+      // Shift pan so the world point stays under cursor
+      panRef.current = { x: mx - w / 2 - wx * newPPU, y: my - h / 2 - wy * newPPU };
+      ppuRef.current = newPPU;
+      syncZoomLabel();
+      renderRef.current();
+    };
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', onWheel);
+  }, [syncZoomLabel]);
+
+  // ---- Keyboard: space pan + Esc + Delete ----
+  useEffect(() => {
+    const onDown = (e: KeyboardEvent) => {
+      const inInput = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
+      if (e.code === 'Space' && !inInput) {
+        e.preventDefault();
+        spaceHeld.current = true;
+        renderRef.current();
+      }
+      if (inInput) return;
       if (e.key === 'Escape') {
         ip.current = { points: [], cursor: null };
         renderRef.current();
@@ -105,37 +193,78 @@ export function SketchCanvas() {
         setSelectedShapes([]);
       }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    const onUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        spaceHeld.current = false;
+        if (!isPanning.current) renderRef.current();
+      }
+    };
+    window.addEventListener('keydown', onDown);
+    window.addEventListener('keyup',   onUp);
+    return () => {
+      window.removeEventListener('keydown', onDown);
+      window.removeEventListener('keyup',   onUp);
+    };
   }, [selectedShapeIds, removeShape, setSelectedShapes]);
 
-  // ---- Helpers ----
-  const getPos = useCallback((e: React.MouseEvent<HTMLCanvasElement>): Vec2 => {
-    const rect = canvasRef.current!.getBoundingClientRect();
-    const { w, h } = sizeRef.current;
-    return snap(toWorld(e.clientX - rect.left, e.clientY - rect.top, w, h));
+  // ---- Mouse helpers ----
+  const canvasXY = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const r = canvasRef.current!.getBoundingClientRect();
+    return { cx: e.clientX - r.left, cy: e.clientY - r.top };
   }, []);
 
-  // ---- Event handlers ----
+  const worldPos = useCallback((cx: number, cy: number): Vec2 => {
+    const { w, h } = sizeRef.current;
+    return snapGrid(toWorld(cx, cy, w, h, ppuRef.current, panRef.current));
+  }, []);
+
+  // ---- Canvas events ----
+  const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (e.button === 1 || (e.button === 0 && spaceHeld.current)) {
+      e.preventDefault();
+      const { cx, cy } = canvasXY(e);
+      isPanning.current = true;
+      panStart.current  = { mx: cx, my: cy, px: panRef.current.x, py: panRef.current.y };
+      renderRef.current();
+    }
+  }, [canvasXY]);
+
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    const pos = getPos(e);
+    const { cx, cy } = canvasXY(e);
+
+    if (isPanning.current) {
+      const { mx, my, px, py } = panStart.current;
+      panRef.current = { x: px + (cx - mx), y: py + (cy - my) };
+      renderRef.current();
+      return;
+    }
+
+    const pos = worldPos(cx, cy);
     ip.current.cursor = pos;
     renderRef.current();
-    // Direct DOM write — no React re-render needed
-    if (coordsRef.current)
-      coordsRef.current.textContent = `x ${pos.x.toFixed(1)}  y ${pos.y.toFixed(1)}`;
-  }, [getPos]);
+
+    if (coordsRef.current) {
+      const { hAxis, vAxis } = VIEW_META[view];
+      coordsRef.current.textContent = `${hAxis} ${pos.x.toFixed(1)}  ${vAxis} ${pos.y.toFixed(1)}`;
+    }
+  }, [canvasXY, worldPos, view]);
+
+  const handleMouseUp = useCallback(() => {
+    if (isPanning.current) { isPanning.current = false; renderRef.current(); }
+  }, []);
 
   const handleMouseLeave = useCallback(() => {
-    ip.current.cursor = null;
+    isPanning.current  = false;
+    ip.current.cursor  = null;
     renderRef.current();
     if (coordsRef.current) coordsRef.current.textContent = '';
   }, []);
 
   const handleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    const pos = getPos(e);
+    if (spaceHeld.current || e.button !== 0) return;
+    const { cx, cy } = canvasXY(e);
+    const pos = worldPos(cx, cy);
 
-    // --- Select ---
     if (activeTool === 'select') {
       let best: string | null = null;
       let bestD = 1.2;
@@ -147,7 +276,6 @@ export function SketchCanvas() {
       return;
     }
 
-    // --- Room: accumulate until closed ---
     if (activeTool === 'room') {
       if (ip.current.points.length >= 3 && dist2(pos, ip.current.points[0]) < 0.7) {
         addShape('room', [...ip.current.points]);
@@ -159,16 +287,15 @@ export function SketchCanvas() {
       return;
     }
 
-    // --- Fixed-point tools ---
     ip.current.points = [...ip.current.points, pos];
-    const REQUIRED: Partial<Record<string, number>> = { wall: 2, dome: 2, column: 1, arch: 2 };
-    const need = REQUIRED[activeTool];
+    const REQ: Partial<Record<string, number>> = { wall: 2, dome: 2, column: 1, arch: 2, stairs: 2 };
+    const need = REQ[activeTool];
     if (need && ip.current.points.length >= need) {
       addShape(activeTool as ShapeKind, [...ip.current.points]);
       ip.current.points = [];
     }
     renderRef.current();
-  }, [activeTool, sketch.shapes, addShape, setSelectedShapes, getPos]);
+  }, [activeTool, sketch.shapes, addShape, setSelectedShapes, canvasXY, worldPos]);
 
   const handleDblClick = useCallback(() => {
     if (activeTool === 'room' && ip.current.points.length >= 3) {
@@ -178,35 +305,88 @@ export function SketchCanvas() {
     }
   }, [activeTool, addShape]);
 
+  // ---- View / zoom controls ----
+  const handleSetView = useCallback((v: CanvasView) => {
+    ppuRef.current  = DEFAULT_PPU;
+    panRef.current  = { x: 0, y: 0 };
+    syncZoomLabel();
+    setView(v);
+    // useEffect on `view` will fire renderRef.current()
+  }, [syncZoomLabel]);
+
+  const handleZoomBtn = useCallback((dir: 1 | -1) => {
+    const factor = dir > 0 ? 1.25 : 1 / 1.25;
+    const newPPU  = Math.max(MIN_PPU, Math.min(MAX_PPU, ppuRef.current * factor));
+    const ratio   = newPPU / ppuRef.current;
+    // Zoom toward canvas centre
+    panRef.current  = { x: panRef.current.x * ratio, y: panRef.current.y * ratio };
+    ppuRef.current  = newPPU;
+    syncZoomLabel();
+    renderRef.current();
+  }, [syncZoomLabel]);
+
+  const handleResetView = useCallback(() => {
+    ppuRef.current = DEFAULT_PPU;
+    panRef.current = { x: 0, y: 0 };
+    syncZoomLabel();
+    renderRef.current();
+  }, [syncZoomLabel]);
+
   return (
     <div ref={containerRef} className="w-full h-full relative">
-      {/* Canvas — fills container absolutely */}
+      {/* Canvas */}
       <canvas
         ref={canvasRef}
         style={{ display: 'block', position: 'absolute', inset: 0 }}
+        onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseLeave}
         onClick={handleClick}
         onDoubleClick={handleDblClick}
+        onContextMenu={e => e.preventDefault()}
       />
 
-      {/* Status bar */}
-      <div className="absolute bottom-2 left-2 flex gap-4 text-[10px] font-mono pointer-events-none">
-        <span className="text-neutral-700">{PPU}px=1m · snap {GRID}m</span>
-        <span ref={coordsRef} className="text-neutral-500" />
+      {/* ── Top-right overlay: view selector + zoom ── */}
+      <div className="absolute top-2 right-2 flex items-center gap-1 bg-neutral-900/85 backdrop-blur-sm border border-neutral-700 rounded px-2 py-1">
+        {/* View buttons */}
+        {(['top', 'front', 'side'] as CanvasView[]).map(v => (
+          <button key={v} onClick={() => handleSetView(v)} className={view === v ? BTN_ON : BTN_OFF}>
+            {v}
+          </button>
+        ))}
+
+        <div className="w-px h-3 bg-neutral-700 mx-0.5" />
+
+        {/* Zoom controls */}
+        <button onClick={() => handleZoomBtn(-1)} className={BTN_OFF} title="Zoom out">−</button>
+        <span
+          ref={zoomLabelRef}
+          className="text-[10px] font-mono text-neutral-400 w-9 text-center"
+        >100%</span>
+        <button onClick={() => handleZoomBtn(1)} className={BTN_OFF} title="Zoom in">+</button>
+        <button onClick={handleResetView} className={BTN_OFF} title="Reset view (1:1, centred)">⟲</button>
       </div>
 
-      {/* Hint when canvas is empty */}
+      {/* ── Bottom-left: hints + cursor coords ── */}
+      <div className="absolute bottom-2 left-2 flex items-center gap-3 pointer-events-none">
+        <span className="text-[10px] font-mono text-neutral-700">
+          scroll zoom · space+drag pan · mid-mouse pan
+        </span>
+        <span ref={coordsRef} className="text-[10px] font-mono text-neutral-500" />
+      </div>
+
+      {/* Empty state */}
       {sketch.shapes.length === 0 && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="text-center">
-            <div className="text-3xl mb-3 opacity-30">✏️</div>
+            <div className="text-3xl mb-3 opacity-20">✏️</div>
             <div className="text-sm text-neutral-600">Pick a tool and click to draw</div>
             <div className="text-xs text-neutral-700 mt-1 font-mono">
-              W wall · R room · D dome · C column · A arch
+              W wall · R room · D dome · C column · A arch · T stairs
             </div>
             <div className="text-xs text-neutral-700 mt-0.5 font-mono">
-              Esc cancel · Del remove selected
+              Esc cancel · Del remove · Space pan
             </div>
           </div>
         </div>
@@ -215,17 +395,24 @@ export function SketchCanvas() {
   );
 }
 
-// ============================================================
-// Drawing helpers
-// ============================================================
+// ================================================================
+// Drawing helpers — all accept ppu + pan for dynamic transform
+// ================================================================
 
-function drawGrid(ctx: CanvasRenderingContext2D, w: number, h: number) {
-  const step = GRID * PPU;
-  const ox = (w / 2) % step;
-  const oy = (h / 2) % step;
+function drawGrid(
+  ctx: CanvasRenderingContext2D,
+  w: number, h: number,
+  ppu: number,
+  pan: { x: number; y: number },
+  vm: typeof VIEW_META[CanvasView],
+) {
+  const step = GRID * ppu;
 
+  // Minor grid lines
+  const ox = ((w / 2 + pan.x) % step + step) % step;
+  const oy = ((h / 2 + pan.y) % step + step) % step;
   ctx.strokeStyle = '#1e1e30';
-  ctx.lineWidth = 0.5;
+  ctx.lineWidth   = 0.5;
   for (let x = ox; x <= w; x += step) {
     ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
   }
@@ -233,38 +420,58 @@ function drawGrid(ctx: CanvasRenderingContext2D, w: number, h: number) {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
   }
 
-  // Axes
-  ctx.strokeStyle = '#2a2a44';
-  ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(w / 2, 0); ctx.lineTo(w / 2, h); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+  // Axes through world origin
+  const ax = w / 2 + pan.x; // canvas X of world origin
+  const ay = h / 2 + pan.y; // canvas Y of world origin
+
+  // Horizontal axis (H-axis of current view)
+  ctx.strokeStyle = vm.hColor + '99';
+  ctx.lineWidth   = 1;
+  ctx.beginPath(); ctx.moveTo(0, ay); ctx.lineTo(w, ay); ctx.stroke();
+
+  // Vertical axis (V-axis of current view)
+  ctx.strokeStyle = vm.vColor + '99';
+  ctx.beginPath(); ctx.moveTo(ax, 0); ctx.lineTo(ax, h); ctx.stroke();
+
+  // Axis labels at canvas edges
+  ctx.font = 'bold 10px monospace';
+  ctx.fillStyle = vm.hColor + 'cc';
+  ctx.fillText(vm.hAxis, Math.min(w - 18, Math.max(4, ax + 6)), ay - 5);
+  ctx.fillStyle = vm.vColor + 'cc';
+  ctx.fillText(vm.vAxis, ax + 5, Math.min(h - 4, Math.max(14, ay - 6)));
+
+  // Origin dot
+  if (ax > 0 && ax < w && ay > 0 && ay < h) {
+    ctx.fillStyle = '#ffffff33';
+    ctx.beginPath(); ctx.arc(ax, ay, 2.5, 0, Math.PI * 2); ctx.fill();
+  }
 }
 
 function drawShape(
   ctx: CanvasRenderingContext2D,
   shape: SketchShape,
   w: number, h: number,
+  ppu: number,
+  pan: { x: number; y: number },
   selected: boolean,
 ) {
   const col = selected ? '#f97316' : (COLOR[shape.kind] ?? '#94a3b8');
-  const pts = shape.points.map(p => toCanvas(p.x, p.y, w, h));
+  const pts = shape.points.map(p => toCanvas(p.x, p.y, w, h, ppu, pan));
   ctx.strokeStyle = col;
-  ctx.lineWidth = selected ? 2 : 1.5;
+  ctx.lineWidth   = selected ? 2 : 1.5;
   ctx.setLineDash([]);
 
   switch (shape.kind) {
     case 'wall': {
       if (pts.length < 2) return;
       ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); ctx.lineTo(pts[1][0], pts[1][1]); ctx.stroke();
-      for (const [px, py] of pts) {
-        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill();
-      }
+      for (const [px, py] of pts) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill(); }
       // Length label
-      const len = Math.hypot(shape.points[1].x - shape.points[0].x, shape.points[1].y - shape.points[0].y);
-      const mx = (pts[0][0] + pts[1][0]) / 2;
-      const my = (pts[0][1] + pts[1][1]) / 2;
+      const len = dist2(shape.points[0], shape.points[1]).toFixed(1);
+      const mx  = (pts[0][0] + pts[1][0]) / 2;
+      const my  = (pts[0][1] + pts[1][1]) / 2;
       ctx.fillStyle = col + 'aa'; ctx.font = '9px monospace';
-      ctx.fillText(`${len.toFixed(1)}m`, mx + 4, my - 4);
+      ctx.fillText(`${len}m`, mx + 4, my - 4);
       break;
     }
     case 'room': {
@@ -281,29 +488,39 @@ function drawShape(
       ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], r, 0, Math.PI * 2);
       ctx.fillStyle = col + '1a'; ctx.fill(); ctx.stroke();
       ctx.fillStyle = col; ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], 3, 0, Math.PI * 2); ctx.fill();
-      const worldR = (r / PPU).toFixed(1);
       ctx.fillStyle = col + 'aa'; ctx.font = '9px monospace';
-      ctx.fillText(`r ${worldR}m`, pts[0][0] + 4, pts[0][1] - r - 4);
+      ctx.fillText(`r ${(r / ppu).toFixed(1)}m`, pts[0][0] + 4, pts[0][1] - r - 4);
       break;
     }
     case 'arch': {
       if (pts.length < 2) return;
-      const [ax, ay] = pts[0];
-      const [bx, by] = pts[1];
-      const mx = (ax + bx) / 2;
-      const my = (ay + by) / 2;
+      const [ax, ay] = pts[0]; const [bx, by] = pts[1];
+      const mx = (ax + bx) / 2; const my = (ay + by) / 2;
       ctx.beginPath(); ctx.moveTo(ax, ay);
-      ctx.quadraticCurveTo(mx, my - 60, bx, by);
-      ctx.stroke();
-      for (const [px, py] of pts) {
-        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill();
-      }
+      ctx.quadraticCurveTo(mx, my - ppu * 1.5, bx, by); ctx.stroke();
+      for (const [px, py] of pts) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill(); }
       break;
     }
     case 'column': {
       if (pts.length < 1) return;
-      ctx.fillStyle = col + '44';
-      ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], 8, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      const r = Math.max(4, ppu * 0.15);
+      ctx.fillStyle = col + '44'; ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      break;
+    }
+    case 'stairs': {
+      if (pts.length < 2) return;
+      const STEPS = 4;
+      const [ax2, ay2] = pts[0]; const [bx2, by2] = pts[1];
+      ctx.beginPath(); ctx.moveTo(ax2, ay2);
+      for (let i = 1; i <= STEPS; i++) {
+        const t  = i / STEPS;
+        const nx = ax2 + (bx2 - ax2) * t;
+        const ny = ay2 + (by2 - ay2) * t;
+        ctx.lineTo(nx - (by2 - ay2) * 0.08 * (STEPS - i + 0.5), ny + (bx2 - ax2) * 0.08 * (STEPS - i + 0.5));
+        ctx.lineTo(nx, ny);
+      }
+      ctx.stroke();
+      for (const [px, py] of pts) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill(); }
       break;
     }
     default: {
@@ -314,10 +531,10 @@ function drawShape(
     }
   }
 
-  // Kind label
+  // Kind label at centroid
   const c = centroid(shape.points);
-  const [lx, ly] = toCanvas(c.x, c.y, w, h);
-  ctx.fillStyle = col + 'cc'; ctx.font = '9px monospace';
+  const [lx, ly] = toCanvas(c.x, c.y, w, h, ppu, pan);
+  ctx.fillStyle = col + 'bb'; ctx.font = '9px monospace';
   ctx.fillText(shape.label ?? shape.kind, lx + 8, ly - 6);
 }
 
@@ -327,22 +544,23 @@ function drawPreview(
   points: Vec2[],
   cursor: Vec2,
   w: number, h: number,
+  ppu: number,
+  pan: { x: number; y: number },
 ) {
   const col = '#f97316';
-  const [curX, curY] = toCanvas(cursor.x, cursor.y, w, h);
-  const pts = points.map(p => toCanvas(p.x, p.y, w, h));
+  const [curX, curY] = toCanvas(cursor.x, cursor.y, w, h, ppu, pan);
+  const pts = points.map(p => toCanvas(p.x, p.y, w, h, ppu, pan));
 
   ctx.strokeStyle = col;
-  ctx.lineWidth = 1.5;
+  ctx.lineWidth   = 1.5;
   ctx.setLineDash([5, 4]);
 
   switch (tool) {
     case 'wall': {
       if (pts.length > 0) {
         ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); ctx.lineTo(curX, curY); ctx.stroke();
-        // Live length
         const len = dist2(points[0], cursor).toFixed(1);
-        ctx.fillStyle = col; ctx.font = '9px monospace'; ctx.setLineDash([]);
+        ctx.setLineDash([]); ctx.fillStyle = col; ctx.font = '9px monospace';
         ctx.fillText(`${len}m`, (pts[0][0] + curX) / 2 + 4, (pts[0][1] + curY) / 2 - 4);
       }
       break;
@@ -352,11 +570,11 @@ function drawPreview(
       if (pts.length > 0) {
         ctx.moveTo(pts[0][0], pts[0][1]);
         for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-      } else { ctx.moveTo(curX, curY); }
+      } else ctx.moveTo(curX, curY);
       ctx.lineTo(curX, curY); ctx.stroke();
+      // Close-hint ring
       if (pts.length >= 3) {
-        ctx.setLineDash([]);
-        ctx.strokeStyle = col + '55';
+        ctx.setLineDash([]); ctx.strokeStyle = col + '55';
         ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], 10, 0, Math.PI * 2); ctx.stroke();
       }
       break;
@@ -365,32 +583,32 @@ function drawPreview(
       if (pts.length > 0) {
         const r = Math.hypot(curX - pts[0][0], curY - pts[0][1]);
         ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], r, 0, Math.PI * 2); ctx.stroke();
-        ctx.fillStyle = col; ctx.font = '9px monospace'; ctx.setLineDash([]);
-        ctx.fillText(`r ${(r / PPU).toFixed(1)}m`, pts[0][0] + 4, pts[0][1] - r - 4);
+        ctx.setLineDash([]); ctx.fillStyle = col; ctx.font = '9px monospace';
+        ctx.fillText(`r ${(r / ppu).toFixed(1)}m`, pts[0][0] + 4, pts[0][1] - r - 4);
       }
       break;
     }
     case 'arch': {
       if (pts.length > 0) {
-        const [ax, ay] = pts[0];
-        const mx = (ax + curX) / 2;
-        const my = (ay + curY) / 2;
-        ctx.beginPath(); ctx.moveTo(ax, ay);
-        ctx.quadraticCurveTo(mx, my - 60, curX, curY); ctx.stroke();
+        const mx = (pts[0][0] + curX) / 2; const my = (pts[0][1] + curY) / 2;
+        ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+        ctx.quadraticCurveTo(mx, my - ppu * 1.5, curX, curY); ctx.stroke();
       }
+      break;
+    }
+    case 'stairs': {
+      if (pts.length > 0) { ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); ctx.lineTo(curX, curY); ctx.stroke(); }
       break;
     }
     case 'column': {
       ctx.setLineDash([]);
-      ctx.strokeStyle = col;
-      ctx.beginPath(); ctx.arc(curX, curY, 8, 0, Math.PI * 2); ctx.stroke();
+      const r = Math.max(4, ppu * 0.15);
+      ctx.beginPath(); ctx.arc(curX, curY, r, 0, Math.PI * 2); ctx.stroke();
       break;
     }
   }
 
   ctx.setLineDash([]);
-  for (const [px, py] of pts) {
-    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill();
-  }
+  for (const [px, py] of pts) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill(); }
   ctx.fillStyle = col; ctx.beginPath(); ctx.arc(curX, curY, 3, 0, Math.PI * 2); ctx.fill();
 }
