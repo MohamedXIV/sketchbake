@@ -1,8 +1,8 @@
 /**
  * SketchBake — Bake Engine
  *
- * Dispatches each SketchShape to its geometry builder.
- * Builders are pure functions: SketchShape → BakedMesh.
+ * One entry point. Dispatches each SketchShape to its geometry builder.
+ * All builders are pure, synchronous functions: SketchShape → BakedMesh.
  */
 
 import type { BakeResult, BakedMesh, SketchDoc, SketchShape } from '../schema/types';
@@ -11,6 +11,7 @@ import { bakeRoom }   from './builders/room';
 import { bakeDome }   from './builders/dome';
 import { bakeColumn } from './builders/column';
 import { bakeArch }   from './builders/arch';
+import { bakeStairs } from './builders/stairs';
 
 export async function bakeSketch(
   sketch: SketchDoc,
@@ -34,13 +35,14 @@ function bakeShape(shape: SketchShape): BakedMesh | null {
       case 'dome':   return bakeDome(shape);
       case 'column': return bakeColumn(shape);
       case 'arch':   return bakeArch(shape);
-      // stairs, custom — TODO next iteration
+      case 'stairs': return bakeStairs(shape);
+      // 'custom' — TODO
       default:
-        console.warn(`[bake] No builder for: ${shape.kind}`);
+        console.warn(`[bake] No builder registered for: ${shape.kind}`);
         return null;
     }
   } catch (err) {
-    console.error(`[bake] Shape ${shape.id} failed:`, err);
+    console.error(`[bake] Shape ${shape.id} (${shape.kind}) failed:`, err);
     return null;
   }
 }
