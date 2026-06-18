@@ -3,15 +3,20 @@
 import { useEffect } from 'react';
 import { useSketchStore, Tool } from '../../store/useSketchStore';
 
-const TOOLS: { id: Tool; label: string; icon: string; key: string }[] = [
-  { id: 'select', label: 'Select', icon: '↖', key: 'S' },
-  { id: 'wall',   label: 'Wall',   icon: '▬', key: 'W' },
-  { id: 'room',   label: 'Room',   icon: '⬜', key: 'R' },
-  { id: 'dome',   label: 'Dome',   icon: '◑', key: 'D' },
-  { id: 'column', label: 'Column', icon: '⬤', key: 'C' },
-  { id: 'arch',   label: 'Arch',   icon: '⌒', key: 'A' },
-  { id: 'stairs', label: 'Stairs', icon: '≡', key: 'T' },
+const TOOLS: { id: Tool; icon: string; key: string; label: string }[] = [
+  { id: 'select', icon: '↖', key: 'S', label: 'Select' },
+  { id: 'wall',   icon: '▬', key: 'W', label: 'Wall' },
+  { id: 'room',   icon: '⬜', key: 'R', label: 'Room' },
+  { id: 'dome',   icon: '◑', key: 'D', label: 'Dome' },
+  { id: 'column', icon: '⬤', key: 'C', label: 'Column' },
+  { id: 'arch',   icon: '⌒', key: 'A', label: 'Arch' },
+  { id: 'stairs', icon: '≡', key: 'T', label: 'Stairs' },
+  // divider then cut
+  { id: 'cut',    icon: '□', key: 'X', label: 'Cut (subtract)' },
 ];
+
+// Index of the last solid tool before the divider
+const DIVIDER_BEFORE = 'cut';
 
 export function Toolbar() {
   const activeTool    = useSketchStore(s => s.activeTool);
@@ -30,19 +35,26 @@ export function Toolbar() {
   return (
     <div className="flex flex-col gap-1 p-1.5 bg-neutral-800 border-r border-neutral-700 shrink-0">
       {TOOLS.map(tool => (
-        <button
-          key={tool.id}
-          title={`${tool.label} [${tool.key}]`}
-          onClick={() => setActiveTool(tool.id)}
-          className={[
-            'w-9 h-9 rounded flex items-center justify-center text-base transition-colors',
-            activeTool === tool.id
-              ? 'bg-orange-500 text-white'
-              : 'text-neutral-400 hover:bg-neutral-700 hover:text-white',
-          ].join(' ')}
-        >
-          {tool.icon}
-        </button>
+        <>
+          {tool.id === DIVIDER_BEFORE && (
+            <div key="divider" className="w-full h-px bg-neutral-700 my-0.5" />
+          )}
+          <button
+            key={tool.id}
+            title={`${tool.label} [${tool.key}]`}
+            onClick={() => setActiveTool(tool.id)}
+            className={[
+              'w-9 h-9 rounded flex items-center justify-center text-base transition-colors',
+              activeTool === tool.id
+                ? tool.id === 'cut'
+                  ? 'bg-red-500 text-white'
+                  : 'bg-orange-500 text-white'
+                : 'text-neutral-400 hover:bg-neutral-700 hover:text-white',
+            ].join(' ')}
+          >
+            {tool.icon}
+          </button>
+        </>
       ))}
     </div>
   );
