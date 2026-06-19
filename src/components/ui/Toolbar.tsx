@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { Fragment, useEffect } from 'react';
 import { useSketchStore, Tool } from '../../store/useSketchStore';
 
 const TOOLS: { id: Tool; icon: string; key: string; label: string }[] = [
@@ -11,12 +11,10 @@ const TOOLS: { id: Tool; icon: string; key: string; label: string }[] = [
   { id: 'column', icon: '⬤', key: 'C', label: 'Column' },
   { id: 'arch',   icon: '⌒', key: 'A', label: 'Arch' },
   { id: 'stairs', icon: '≡', key: 'T', label: 'Stairs' },
-  // divider then cut
-  { id: 'cut',    icon: '□', key: 'X', label: 'Cut (subtract)' },
+  { id: 'cut',    icon: '□', key: 'X', label: 'Cut (subtract — doors/windows)' },
 ];
 
-// Index of the last solid tool before the divider
-const DIVIDER_BEFORE = 'cut';
+const DIVIDER_BEFORE: Tool = 'cut';
 
 export function Toolbar() {
   const activeTool    = useSketchStore(s => s.activeTool);
@@ -35,26 +33,23 @@ export function Toolbar() {
   return (
     <div className="flex flex-col gap-1 p-1.5 bg-neutral-800 border-r border-neutral-700 shrink-0">
       {TOOLS.map(tool => (
-        <>
+        <Fragment key={tool.id}>
           {tool.id === DIVIDER_BEFORE && (
-            <div key="divider" className="w-full h-px bg-neutral-700 my-0.5" />
+            <div className="w-full h-px bg-neutral-700 my-0.5" />
           )}
           <button
-            key={tool.id}
             title={`${tool.label} [${tool.key}]`}
             onClick={() => setActiveTool(tool.id)}
             className={[
               'w-9 h-9 rounded flex items-center justify-center text-base transition-colors',
               activeTool === tool.id
-                ? tool.id === 'cut'
-                  ? 'bg-red-500 text-white'
-                  : 'bg-orange-500 text-white'
+                ? tool.id === 'cut' ? 'bg-red-500 text-white' : 'bg-orange-500 text-white'
                 : 'text-neutral-400 hover:bg-neutral-700 hover:text-white',
             ].join(' ')}
           >
             {tool.icon}
           </button>
-        </>
+        </Fragment>
       ))}
     </div>
   );
