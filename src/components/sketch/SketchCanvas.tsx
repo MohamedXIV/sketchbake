@@ -2,7 +2,10 @@
 
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useSketchStore } from '../../store/useSketchStore';
-import type { Vec2, SketchShape, ShapeKind } from '../../lib/schema/types';
+import type {
+  Vec2, SketchShape, ShapeKind,
+  WallParams, RoomParams, ColumnParams, CutParams, DomeParams, ArchParams, StairsParams,
+} from '../../lib/schema/types';
 
 export type CanvasView = 'top' | 'front' | 'side';
 
@@ -20,16 +23,11 @@ const MAX_PPU     = 320;
 const GRID        = 1;
 
 const COLOR: Record<string, string> = {
-  wall:   '#60a5fa',
-  room:   '#34d399',
-  dome:   '#a78bfa',
-  arch:   '#f59e0b',
-  stairs: '#fb923c',
-  column: '#f472b6',
-  cut:    '#ef4444',   // red — subtraction volumes
-  custom: '#94a3b8',
+  wall: '#60a5fa', room: '#34d399', dome: '#a78bfa', arch: '#f59e0b',
+  stairs: '#fb923c', column: '#f472b6', cut: '#ef4444', custom: '#94a3b8',
 };
 
+// ---- Pure coordinate helpers (canvas <-> "view space") ----
 function toWorld(cx: number, cy: number, w: number, h: number, ppu: number, pan: { x: number; y: number }): Vec2 {
   return { x: (cx - w / 2 - pan.x) / ppu, y: (cy - h / 2 - pan.y) / ppu };
 }
@@ -48,9 +46,236 @@ function centroid(pts: Vec2[]): Vec2 {
   return { x: s.x / pts.length, y: s.y / pts.length };
 }
 
+// ================================================================
+// ELEVATION PROJECTION ENGINE
+//
+// Every non-top view (front/side) computes a shape's *actual* 3D
+// footprint + height, then flattens it onto the relevant plane.
+// This is what makes "switch to Side" genuinely show the side of
+// the structure, instead of just relabelling the same plan view.
+//
+// Convention fed into toCanvas: (h, -trueHeight)
+//   h           = the world coordinate along the view's horizontal axis
+//   -trueHeight = negated so larger height draws higher on screen
+//                 (canvas Y grows downward)
+// ================================================================
+
+type ElevationOutline =
+  | { kind: 'rect'; hMin: number; hMax: number; yMin: number; yMax: number }
+  | { kind: 'curve'; points: { h: number; y: number }[]; fillBaseline?: boolean; lineWidthWorld?: number };
+
+function getElevationOutline(shape: SketchShape, view: 'front' | 'side'): ElevationOutline | null {
+  const hOf = (p: Vec2) => (view === 'front' ? p.x : p.y); // p.y always holds world Z
+
+  switch (shape.kind) {
+    case 'wall': {
+      const params = shape.params as WallParams;
+      const [p0, p1] = shape.points;
+      if (!p0 || !p1) return null;
+      const dx = p1.x - p0.x, dz = p1.y - p0.y;
+      const len = Math.hypot(dx, dz);
+      if (len < 1e-6) return null;
+      const angle = Math.atan2(dz, dx);
+      const perp  = angle + Math.PI / 2;
+      const hx = Math.cos(perp) * params.thickness / 2;
+      const hz = Math.sin(perp) * params.thickness / 2;
+      // True footprint corners — same box math as the wall bake builder
+      const corners: Vec2[] = [
+        { x: p0.x + hx, y: p0.y + hz },
+        { x: p0.x - hx, y: p0.y - hz },
+        { x: p1.x + hx, y: p1.y + hz },
+        { x: p1.x - hx, y: p1.y - hz },
+      ];
+      const hs = corners.map(hOf);
+      return { kind: 'rect', hMin: Math.min(...hs), hMax: Math.max(...hs), yMin: 0, yMax: params.height };
+    }
+
+    case 'room': {
+      const params = shape.params as RoomParams;
+      if (shape.points.length < 3) return null;
+      const hs = shape.points.map(hOf);
+      return { kind: 'rect', hMin: Math.min(...hs), hMax: Math.max(...hs), yMin: 0, yMax: params.wallHeight };
+    }
+
+    case 'column': {
+      const params = shape.params as ColumnParams;
+      const [c] = shape.points;
+      if (!c) return null;
+      const h = hOf(c);
+      return { kind: 'rect', hMin: h - params.radius, hMax: h + params.radius, yMin: 0, yMax: params.height };
+    }
+
+    case 'cut': {
+      const params = shape.params as CutParams;
+      const [p0, p1] = shape.points;
+      if (!p0 || !p1) return null;
+      const hs = [hOf(p0), hOf(p1)];
+      return {
+        kind: 'rect',
+        hMin: Math.min(...hs), hMax: Math.max(...hs),
+        yMin: params.sillHeight, yMax: params.sillHeight + params.height,
+      };
+    }
+
+    case 'dome': {
+      // Rotationally symmetric — front and side views share the identical
+      // profile curve (any vertical plane through the axis cuts the same shape).
+      const params = shape.params as DomeParams;
+      const [centre, edge] = shape.points;
+      if (!centre || !edge) return null;
+      const radius  = dist2(centre, edge);
+      const hCentre = hOf(centre);
+      const N = 24;
+      const points: { h: number; y: number }[] = [];
+      for (let i = 0; i <= N; i++) {
+        const s = -1 + (2 * i) / N;
+        const y = params.height * Math.sqrt(Math.max(0, 1 - s * s));
+        points.push({ h: hCentre + s * radius, y });
+      }
+      return { kind: 'curve', points, fillBaseline: true };
+    }
+
+    case 'arch': {
+      // Same arc math as the arch bake builder, projected onto the view axis.
+      // If the arch runs perpendicular to the view, h0≈h1 and the curve
+      // naturally degenerates into a thin vertical band — i.e. you're
+      // looking at the arch end-on, which is exactly correct.
+      const params = shape.params as ArchParams;
+      const [p0, p1] = shape.points;
+      if (!p0 || !p1) return null;
+      const h0 = hOf(p0), h1 = hOf(p1);
+      const N = 24;
+      const points: { h: number; y: number }[] = [];
+      for (let i = 0; i <= N; i++) {
+        const t = (i / N) * Math.PI;
+        const u = Math.cos(Math.PI - t); // -1..1
+        points.push({ h: h0 + (h1 - h0) * (u + 1) / 2, y: Math.sin(t) * params.height });
+      }
+      return { kind: 'curve', points, lineWidthWorld: params.thickness };
+    }
+
+    case 'stairs': {
+      const params = shape.params as StairsParams;
+      const [p0, p1] = shape.points;
+      if (!p0 || !p1) return null;
+      const totalRun = dist2(p0, p1);
+      if (totalRun < 1e-6) return null;
+      const numSteps    = Math.max(1, Math.round(totalRun / params.stepDepth));
+      const totalHeight = numSteps * params.stepHeight;
+      const h0 = hOf(p0), h1 = hOf(p1);
+      const hDelta = h1 - h0;
+      const isEndOn = Math.abs(hDelta) < totalRun * 0.15; // run is mostly perpendicular to this view
+
+      if (isEndOn) {
+        const hc = (h0 + h1) / 2;
+        return { kind: 'rect', hMin: hc - params.width / 2, hMax: hc + params.width / 2, yMin: 0, yMax: totalHeight };
+      }
+
+      // Real stepped silhouette: tread → riser → tread → riser…
+      const points: { h: number; y: number }[] = [{ h: h0, y: 0 }];
+      for (let i = 1; i <= numSteps; i++) {
+        const h = h0 + hDelta * (i / numSteps);
+        points.push({ h, y: (i - 1) * params.stepHeight });
+        points.push({ h, y: i * params.stepHeight });
+      }
+      return { kind: 'curve', points };
+    }
+
+    default:
+      return null; // 'custom' — not yet supported in elevation
+  }
+}
+
+/** Hit-test distance for click selection in elevation views. 0 = inside/on. */
+function elevationHit(pos: Vec2, outline: ElevationOutline): number {
+  if (outline.kind === 'rect') {
+    const trueY = -pos.y;
+    const insideH = pos.x >= outline.hMin - 0.05 && pos.x <= outline.hMax + 0.05;
+    const insideY = trueY >= outline.yMin - 0.05 && trueY <= outline.yMax + 0.05;
+    if (insideH && insideY) return 0;
+    const dx = Math.max(outline.hMin - pos.x, 0, pos.x - outline.hMax);
+    const dy = Math.max(outline.yMin - trueY, 0, trueY - outline.yMax);
+    return Math.hypot(dx, dy);
+  }
+  let best = Infinity;
+  for (const p of outline.points) {
+    const d = Math.hypot(p.h - pos.x, -p.y - pos.y);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/** Bounding centre of an outline, in the same (h, -trueHeight) space as cursor pos */
+function getElevationCenter(outline: ElevationOutline): Vec2 {
+  if (outline.kind === 'rect') {
+    return { x: (outline.hMin + outline.hMax) / 2, y: -(outline.yMin + outline.yMax) / 2 };
+  }
+  const n = outline.points.length;
+  const sum = outline.points.reduce((a, p) => ({ h: a.h + p.h, y: a.y + p.y }), { h: 0, y: 0 });
+  return { x: sum.h / n, y: -(sum.y / n) };
+}
+
+function drawShapeElevation(
+  ctx: CanvasRenderingContext2D,
+  shape: SketchShape,
+  w: number, h: number,
+  ppu: number, pan: { x: number; y: number },
+  selected: boolean,
+  view: 'front' | 'side',
+) {
+  const outline = getElevationOutline(shape, view);
+  if (!outline) return;
+  const col = selected ? '#f97316' : (COLOR[shape.kind] ?? '#94a3b8');
+
+  if (outline.kind === 'rect') {
+    const [x0, y0] = toCanvas(outline.hMin, -outline.yMax, w, h, ppu, pan); // top-left
+    const [x1, y1] = toCanvas(outline.hMax, -outline.yMin, w, h, ppu, pan); // bottom-right
+    const rx = Math.min(x0, x1), ry = Math.min(y0, y1);
+    const rw = Math.abs(x1 - x0), rh = Math.abs(y1 - y0);
+
+    ctx.setLineDash(shape.kind === 'cut' ? [4, 3] : []);
+    ctx.strokeStyle = col;
+    ctx.lineWidth   = selected ? 2 : 1.5;
+    ctx.fillStyle   = col + (shape.kind === 'cut' ? '18' : '22');
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.strokeRect(rx, ry, rw, rh);
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = col + 'cc'; ctx.font = '9px monospace';
+    ctx.fillText(`${(outline.hMax - outline.hMin).toFixed(1)}×${(outline.yMax - outline.yMin).toFixed(1)}m`, rx + 3, ry - 4);
+  } else {
+    ctx.setLineDash([]);
+    ctx.strokeStyle = col;
+    ctx.lineWidth   = outline.lineWidthWorld ? Math.max(2, outline.lineWidthWorld * ppu) : (selected ? 2 : 1.5);
+
+    const pts = outline.points.map(p => toCanvas(p.h, -p.y, w, h, ppu, pan));
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+
+    if (outline.fillBaseline) {
+      const [bx, by] = toCanvas(outline.points[outline.points.length - 1].h, 0, w, h, ppu, pan);
+      const [ax, ay] = toCanvas(outline.points[0].h, 0, w, h, ppu, pan);
+      ctx.lineTo(bx, by);
+      ctx.lineTo(ax, ay);
+      ctx.closePath();
+      ctx.fillStyle = col + '22';
+      ctx.fill();
+    }
+    ctx.stroke();
+  }
+
+  if (shape.kind !== 'cut') {
+    const center = getElevationCenter(outline);
+    const [lx, ly] = toCanvas(center.x, center.y, w, h, ppu, pan);
+    ctx.fillStyle = col + 'bb'; ctx.font = '9px monospace';
+    ctx.fillText(shape.label ?? shape.kind, lx + 8, ly - 6);
+  }
+}
+
 interface InProgress { points: Vec2[]; cursor: Vec2 | null; }
 
-const BTN  = 'px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer';
+const BTN = 'px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer';
 const BTN_ON  = `${BTN} bg-neutral-600 text-white`;
 const BTN_OFF = `${BTN} text-neutral-500 hover:bg-neutral-700 hover:text-white`;
 
@@ -71,9 +296,9 @@ export function SketchCanvas() {
   const ip        = useRef<InProgress>({ points: [], cursor: null });
   const renderRef = useRef<() => void>(() => {});
 
-  const isPanning  = useRef(false);
-  const panStart   = useRef({ mx: 0, my: 0, px: 0, py: 0 });
-  const spaceHeld  = useRef(false);
+  const isPanning = useRef(false);
+  const panStart  = useRef({ mx: 0, my: 0, px: 0, py: 0 });
+  const spaceHeld = useRef(false);
 
   const sketch            = useSketchStore(s => s.sketch);
   const activeTool        = useSketchStore(s => s.activeTool);
@@ -97,24 +322,27 @@ export function SketchCanvas() {
       const { w, h } = sizeRef.current;
       const ppu = ppuRef.current;
       const pan = panRef.current;
-      const vm  = VIEW_META[viewRef.current];
+      const v   = viewRef.current;
+      const vm  = VIEW_META[v];
 
       canvas.style.cursor =
         isPanning.current ? 'grabbing' :
-        spaceHeld.current ? 'grab'     :
-        activeTool === 'select' ? 'default' :
-        activeTool === 'cut'    ? 'crosshair' : 'crosshair';
+        spaceHeld.current ? 'grab' :
+        activeTool === 'select' ? 'default' : 'crosshair';
 
       ctx.clearRect(0, 0, w, h);
       ctx.fillStyle = '#161622';
       ctx.fillRect(0, 0, w, h);
       drawGrid(ctx, w, h, ppu, pan, vm);
 
-      for (const shape of sketch.shapes)
-        drawShape(ctx, shape, w, h, ppu, pan, selectedShapeIds.includes(shape.id));
+      for (const shape of sketch.shapes) {
+        const selected = selectedShapeIds.includes(shape.id);
+        if (v === 'top') drawShapeTop(ctx, shape, w, h, ppu, pan, selected);
+        else drawShapeElevation(ctx, shape, w, h, ppu, pan, selected, v);
+      }
 
       const { points, cursor } = ip.current;
-      if (cursor) drawPreview(ctx, activeTool, points, cursor, w, h, ppu, pan);
+      if (cursor && v === 'top') drawPreview(ctx, activeTool, points, cursor, w, h, ppu, pan);
     };
     renderRef.current();
   }, [sketch, selectedShapeIds, activeTool, view]);
@@ -211,11 +439,12 @@ export function SketchCanvas() {
     renderRef.current();
     if (coordsRef.current) {
       const { hAxis, vAxis } = VIEW_META[view];
-      coordsRef.current.textContent = `${hAxis} ${pos.x.toFixed(1)}  ${vAxis} ${pos.y.toFixed(1)}`;
+      const vVal = view === 'top' ? pos.y : -pos.y; // elevation: show true height, not the flipped internal value
+      coordsRef.current.textContent = `${hAxis} ${pos.x.toFixed(1)}  ${vAxis} ${vVal.toFixed(1)}`;
     }
   }, [canvasXY, worldPos, view]);
 
-  const handleMouseUp    = useCallback(() => { if (isPanning.current) { isPanning.current = false; renderRef.current(); } }, []);
+  const handleMouseUp = useCallback(() => { if (isPanning.current) { isPanning.current = false; renderRef.current(); } }, []);
   const handleMouseLeave = useCallback(() => {
     isPanning.current = false; ip.current.cursor = null; renderRef.current();
     if (coordsRef.current) coordsRef.current.textContent = '';
@@ -226,15 +455,28 @@ export function SketchCanvas() {
     const { cx, cy } = canvasXY(e);
     const pos = worldPos(cx, cy);
 
+    // ---- Select: works in every view, using the right hit-test per view ----
     if (activeTool === 'select') {
-      let best: string | null = null, bestD = 1.2;
+      let best: string | null = null;
+      let bestD = view === 'top' ? 1.2 : 1.0;
       for (const shape of sketch.shapes) {
-        const d = dist2(centroid(shape.points), pos);
-        if (d < bestD) { bestD = d; best = shape.id; }
+        if (view === 'top') {
+          const d = dist2(centroid(shape.points), pos);
+          if (d < bestD) { bestD = d; best = shape.id; }
+        } else {
+          const outline = getElevationOutline(shape, view);
+          if (!outline) continue;
+          const d = elevationHit(pos, outline);
+          if (d < bestD) { bestD = d; best = shape.id; }
+        }
       }
       setSelectedShapes(best ? [best] : []);
       return;
     }
+
+    // ---- Drawing is plan-only: shapes are sketched in Top view, then
+    //      Front/Side just show the computed result. No-op elsewhere. ----
+    if (view !== 'top') return;
 
     if (activeTool === 'room') {
       if (ip.current.points.length >= 3 && dist2(pos, ip.current.points[0]) < 0.7) {
@@ -251,31 +493,38 @@ export function SketchCanvas() {
       ip.current.points = [];
     }
     renderRef.current();
-  }, [activeTool, sketch.shapes, addShape, setSelectedShapes, canvasXY, worldPos]);
+  }, [activeTool, sketch.shapes, addShape, setSelectedShapes, canvasXY, worldPos, view]);
 
   const handleDblClick = useCallback(() => {
-    if (activeTool === 'room' && ip.current.points.length >= 3) {
+    if (view === 'top' && activeTool === 'room' && ip.current.points.length >= 3) {
       addShape('room', [...ip.current.points]); ip.current.points = []; renderRef.current();
     }
-  }, [activeTool, addShape]);
+  }, [activeTool, addShape, view]);
 
   // ---- View / zoom controls ----
   const handleSetView = useCallback((v: CanvasView) => {
-    ppuRef.current = DEFAULT_PPU; panRef.current = { x: 0, y: 0 };
-    syncZoomLabel(); setView(v);
+    ppuRef.current = DEFAULT_PPU;
+    panRef.current = { x: 0, y: 0 };
+    ip.current     = { points: [], cursor: null }; // discard any in-progress draw on view switch
+    syncZoomLabel();
+    setView(v);
   }, [syncZoomLabel]);
+
   const handleZoomBtn = useCallback((dir: 1 | -1) => {
     const factor = dir > 0 ? 1.25 : 1 / 1.25;
-    const newPPU = Math.max(MIN_PPU, Math.min(MAX_PPU, ppuRef.current * factor));
-    const ratio  = newPPU / ppuRef.current;
-    panRef.current  = { x: panRef.current.x * ratio, y: panRef.current.y * ratio };
-    ppuRef.current  = newPPU;
+    const newPPU  = Math.max(MIN_PPU, Math.min(MAX_PPU, ppuRef.current * factor));
+    const ratio   = newPPU / ppuRef.current;
+    panRef.current = { x: panRef.current.x * ratio, y: panRef.current.y * ratio };
+    ppuRef.current = newPPU;
     syncZoomLabel(); renderRef.current();
   }, [syncZoomLabel]);
+
   const handleResetView = useCallback(() => {
     ppuRef.current = DEFAULT_PPU; panRef.current = { x: 0, y: 0 };
     syncZoomLabel(); renderRef.current();
   }, [syncZoomLabel]);
+
+  const drawingDisabled = view !== 'top' && activeTool !== 'select';
 
   return (
     <div ref={containerRef} className="w-full h-full relative">
@@ -294,7 +543,9 @@ export function SketchCanvas() {
       {/* View + zoom overlay */}
       <div className="absolute top-2 right-2 flex items-center gap-1 bg-neutral-900/85 backdrop-blur-sm border border-neutral-700 rounded px-2 py-1">
         {(['top', 'front', 'side'] as CanvasView[]).map(v => (
-          <button key={v} onClick={() => handleSetView(v)} className={view === v ? BTN_ON : BTN_OFF}>{v}</button>
+          <button key={v} onClick={() => handleSetView(v)} className={view === v ? BTN_ON : BTN_OFF} title={VIEW_META[v].label}>
+            {v}
+          </button>
         ))}
         <div className="w-px h-3 bg-neutral-700 mx-0.5" />
         <button onClick={() => handleZoomBtn(-1)} className={BTN_OFF}>−</button>
@@ -311,8 +562,14 @@ export function SketchCanvas() {
         <span ref={coordsRef} className="text-[10px] font-mono text-neutral-500" />
       </div>
 
-      {/* Cut tool hint */}
-      {activeTool === 'cut' && (
+      {/* Mode hints */}
+      {drawingDisabled ? (
+        <div className="absolute top-2 left-2 bg-neutral-900/85 border border-neutral-700 rounded px-2 py-1 pointer-events-none">
+          <span className="text-[10px] font-mono text-neutral-400">
+            {VIEW_META[view].label} is a live preview — switch to <b className="text-orange-400">Top</b> to draw
+          </span>
+        </div>
+      ) : activeTool === 'cut' && view === 'top' && (
         <div className="absolute top-2 left-2 bg-red-950/80 border border-red-800 rounded px-2 py-1 pointer-events-none">
           <span className="text-[10px] font-mono text-red-400">
             ✂ Cut — click two corners to draw a subtraction volume
@@ -321,7 +578,7 @@ export function SketchCanvas() {
       )}
 
       {/* Empty state */}
-      {sketch.shapes.length === 0 && (
+      {sketch.shapes.length === 0 && view === 'top' && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="text-center">
             <div className="text-3xl mb-3 opacity-20">✏️</div>
@@ -340,7 +597,7 @@ export function SketchCanvas() {
 }
 
 // ================================================================
-// Drawing helpers
+// Top-view (plan) drawing — unchanged from before
 // ================================================================
 
 function drawGrid(
@@ -369,9 +626,9 @@ function drawGrid(
   }
 }
 
-function drawShape(
+function drawShapeTop(
   ctx: CanvasRenderingContext2D,
-  shape: ReturnType<typeof useSketchStore.getState>['sketch']['shapes'][number],
+  shape: SketchShape,
   w: number, h: number,
   ppu: number, pan: { x: number; y: number },
   selected: boolean,
@@ -437,11 +694,8 @@ function drawShape(
       ctx.setLineDash([4, 3]);
       ctx.fillStyle = col + '1e'; ctx.fillRect(minX, minY, rw, rh);
       ctx.strokeRect(minX, minY, rw, rh); ctx.setLineDash([]);
-      // Dimension labels
-      const ww = (rw / ppu).toFixed(1), hh = (rh / ppu).toFixed(1);
       ctx.fillStyle = col + 'bb'; ctx.font = '9px monospace';
-      ctx.fillText(`${ww}×${hh}m`, minX + 3, minY - 4);
-      // ✂ icon at centre
+      ctx.fillText(`${(rw / ppu).toFixed(1)}×${(rh / ppu).toFixed(1)}m`, minX + 3, minY - 4);
       ctx.fillStyle = col + '88'; ctx.font = '12px monospace';
       ctx.fillText('✂', minX + rw / 2 - 6, minY + rh / 2 + 5);
       break;
@@ -453,7 +707,6 @@ function drawShape(
     }
   }
 
-  // Kind label
   const c = centroid(shape.points);
   const [lx, ly] = toCanvas(c.x, c.y, w, h, ppu, pan);
   if (shape.kind !== 'cut') {
@@ -504,16 +757,13 @@ function drawPreview(
     }
     case 'cut': {
       if (pts.length > 0) {
-        // Live rectangle preview
         const minX = Math.min(pts[0][0], curX), minY = Math.min(pts[0][1], curY);
-        const rw   = Math.abs(curX - pts[0][0]),   rh = Math.abs(curY - pts[0][1]);
+        const rw = Math.abs(curX - pts[0][0]), rh = Math.abs(curY - pts[0][1]);
         ctx.fillStyle = col + '18'; ctx.fillRect(minX, minY, rw, rh);
         ctx.strokeRect(minX, minY, rw, rh);
-        // World dimensions
         ctx.setLineDash([]); ctx.fillStyle = col; ctx.font = '9px monospace';
         ctx.fillText(`${(rw / ppu).toFixed(1)}×${(rh / ppu).toFixed(1)}m`, minX + 3, minY - 4);
       } else {
-        // First click not placed yet — show cursor cross
         ctx.setLineDash([3, 3]); ctx.strokeStyle = col + '88';
         ctx.beginPath(); ctx.moveTo(curX - 8, curY); ctx.lineTo(curX + 8, curY); ctx.stroke();
         ctx.beginPath(); ctx.moveTo(curX, curY - 8); ctx.lineTo(curX, curY + 8); ctx.stroke();
